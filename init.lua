@@ -6,7 +6,8 @@
 -- When the clipboard holds an image (a screenshot, an image copied from a
 -- browser, or an image file copied in Finder), the action copies it to the
 -- machine that runs the focused terminal and pastes the file's absolute path.
--- Otherwise it pastes the clipboard text.
+-- Without an image, it does nothing: text is for Rex's own paste, Cmd+V,
+-- which asks first when pasted text could run commands.
 --
 -- The action runs in the Mac's own Rex server, which can read the clipboard.
 -- For a pane on another Rex server (ctx.server), the file travels over Rex's
@@ -297,9 +298,7 @@ function M.paste(ctx)
   local src, ext = read_clipboard(base)
 
   if not src then
-    local text = exec({ "pbpaste" }, { env = { LANG = "en_US.UTF-8", LC_ALL = "en_US.UTF-8" } })
-    if text ~= "" then paste_text(api, ctx, text) end
-    return { pasted = "text" }
+    return { pasted = "nothing" }
   end
 
   -- Name the image after the clipboard's bytes, so pasting it again reuses
@@ -346,8 +345,8 @@ function M.setup(opts)
   end
   rex.action{
     name = "image_paste",
-    title = "Paste (Images as File Paths)",
-    description = "Paste the clipboard. An image is copied to the pane's machine, and its path is pasted.",
+    title = "Paste Image as File Path",
+    description = "Paste the clipboard's image as a file path. In a pane on another server, the image is copied there first.",
     category = "Clipboard",
     keywords = "clipboard screenshot image upload agent",
     run = function(ctx) return M.paste(ctx) end,

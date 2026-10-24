@@ -4,9 +4,10 @@
 --   rex do test/e2e.lua host=LABEL      # a pane on another Rex server
 --   rex do test/e2e.lua host=LABEL kind=tiff src=/path/to/image.png
 --
--- kind is png, tiff, or file: how the image is put on the clipboard. The test
--- uses a private pasteboard, so it never changes your clipboard, and pastes
--- into a hidden terminal that it closes afterward.
+-- kind is png, tiff, or file: how the image is put on the clipboard. kind=text
+-- puts text there instead, and checks that nothing is pasted. The test uses a
+-- private pasteboard, so it never changes your clipboard, and pastes into a
+-- hidden terminal that it closes afterward.
 
 local root = debug.getinfo(1, "S").source:match("^@?(.*)/test/[^/]+$") or "."
 local M = dofile(root .. "/init.lua")
@@ -20,7 +21,8 @@ function run(argv) {
   if (kind === 'png') pb.setDataForType($.NSData.dataWithContentsOfFile(path), $.NSPasteboardTypePNG);
   else if (kind === 'tiff') pb.setDataForType($.NSImage.alloc.initWithContentsOfFile(path).TIFFRepresentation, $.NSPasteboardTypeTIFF);
   else if (kind === 'file') pb.writeObjects($([$.NSURL.fileURLWithPath(path)]));
-  else throw new Error('kind must be png, tiff, or file');
+  else if (kind === 'text') pb.setStringForType(path, $.NSPasteboardTypeString);
+  else throw new Error('kind must be png, tiff, file, or text');
   return 'ok';
 }
 ]=]
@@ -30,7 +32,9 @@ local kind = rex.args.kind or "png"
 local src = rex.args.src
 local failed = false
 
-if not src then
+if kind == "text" then
+  src = "echo one\necho two"
+elseif not src then
   -- Every Mac has this icon; convert it to a PNG to paste.
   src = (os.getenv("TMPDIR") or "/tmp"):gsub("/+$", "") .. "/rex-image-paste-test.png"
   rex.exec({ "sips", "-s", "format", "png",
@@ -88,11 +92,25 @@ local function paste_and_check(label)
   return result
 end
 
-local first = paste_and_check("first paste")
+local first = kind ~= "text" and paste_and_check("first paste")
 local again = first and paste_and_check("same image again")
 if again then
   check(again.cached, "the same image was copied again")
   check(again.path == first.path, "the same image got another path: " .. tostring(again.path))
+end
+
+if kind == "text" then
+  local ok, result = pcall(M.paste, { server = host, session_id = session_id, block_id = target })
+  if check(ok, "text: " .. tostring(result)) then
+    check(result.pasted == "nothing", "text: pasted " .. tostring(result.pasted) .. ", not nothing")
+    rex.sleep(0.3)
+    local screen = api.call("block.method", {
+      session_id = session_id, block_id = target, method = "format", args = { trim = true },
+    })
+    local shown = screen and screen.content or ""
+    check(not shown:find("echo", 1, true), "text: the pane received the text: " .. shown)
+    rex.log("text: pasted nothing" .. (host and (" on " .. host) or ""))
+  end
 end
 
 -- Remove the test images.

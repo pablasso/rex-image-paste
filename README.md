@@ -4,7 +4,7 @@ Paste images into [Rex](https://www.superlogical.com/rex) panes on remote server
 
 ## Overview
 
-With an image on the clipboard, press <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> and the image's file path is pasted into the focused pane. If the pane runs on another Rex server, the image is first copied to that machine, so the path works there. Agents such as Claude Code attach pasted image paths. With text on the clipboard, the key pastes the text.
+With an image on the clipboard, press <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> and the image's file path is pasted into the focused pane. If the pane runs on another Rex server, the image is first copied to that machine, so the path works there. Agents such as Claude Code attach pasted image paths. Without an image on the clipboard, the key does nothing; paste text with <kbd>Cmd</kbd>+<kbd>V</kbd> as usual.
 
 ## How it works
 

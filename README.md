@@ -8,9 +8,9 @@ With an image on the clipboard, press <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>V</kb
 
 ## How it works
 
-- A custom Rex action in your Mac's Rex configuration reads the clipboard: a screenshot, an image copied from an app, or an image file copied in Finder. Images whose long edge is over 2000 pixels are shrunk.
+- A custom Rex action in your Mac's Rex configuration reads the clipboard: a screenshot, an image copied from an app, or an image file copied in Finder. Images whose long edge is over 2000 pixels are shrunk, and formats agents can't read, such as HEIC, are converted to PNG.
 - For a pane on another server, the action opens a hidden terminal there that runs `base64 -d`, types the encoded image into it over Rex's own connection, and checks the result's SHA-256. The remote needs no SSH or setup, only `sh` and `base64`.
-- The action then pastes the path, such as `/tmp/rex-image-paste-1000/20261023-170206-482a.png`, as a bracketed paste. Images older than a day are deleted on the next paste.
+- The action then pastes the path, such as `/tmp/rex-image-paste-1000/0e24b34aaa3434f1.png`, as a bracketed paste. Each image is named after a hash of its contents, so pasting the same image again reuses the copy without uploading it. Images older than a day are deleted on the next paste.
 
 Uploads use requests of at most 64 KiB, so their speed depends on the latency to the server. A paste gives up after 25 seconds.
 

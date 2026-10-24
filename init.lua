@@ -34,7 +34,8 @@ M.trace = nil -- tests only: function(label, seconds) called after each upload p
 
 local SHELL = "com.superlogical.terminal.shell"
 
--- Prints "png", "file\t<path>", or "none". Writes PNG data to argv[0].
+-- Saves the clipboard's image as it is, to argv[0] plus ".png" or ".tiff".
+-- Prints "png", "tiff", "file\t<path>" for an image file, or "none".
 local CLIPBOARD_JS = [=[
 ObjC.import('AppKit');
 function run(argv) {
@@ -46,34 +47,38 @@ function run(argv) {
     const path = ObjC.unwrap(urls.objectAtIndex(0).path);
     return /\.(png|jpe?g|gif|webp|heic|tiff?|bmp)$/i.test(path) ? 'file\t' + path : 'none';
   }
-  let data = pb.dataForType($.NSPasteboardTypePNG);
-  if (data.isNil()) {
-    const tiff = pb.dataForType($.NSPasteboardTypeTIFF);
-    if (tiff.isNil()) return 'none';
-    const rep = $.NSBitmapImageRep.imageRepWithData(tiff);
-    if (rep.isNil()) return 'none';
-    data = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $());
+  for (const [type, kind] of [[$.NSPasteboardTypePNG, 'png'], [$.NSPasteboardTypeTIFF, 'tiff']]) {
+    const data = pb.dataForType(type);
+    if (data.isNil()) continue;
+    if (!data.writeToFileAtomically(argv[0] + '.' + kind, true)) throw new Error('cannot write ' + argv[0]);
+    return kind;
   }
-  if (!data.writeToFileAtomically(argv[0], true)) throw new Error('cannot write ' + argv[0]);
-  return 'png';
+  return 'none';
 }
 ]=]
 
 -- Runs on the remote machine as: sh -c SCRIPT rex-image-paste NAME
--- Reads base64 lines from its terminal (canonical mode, echo off) until EOF,
--- then prints the file's checksum and path for the action to read.
+-- If the directory already has NAME, it reports a hit. Otherwise it reads
+-- base64 lines from its terminal (canonical mode, echo off) until EOF, then
+-- prints the file's checksum and path for the action.
 local REMOTE_SCRIPT = [=[
 umask 077
-stty -echo 2>/dev/null
-( sleep 120; kill 0 ) 2>/dev/null &
 d="${TMPDIR:-/tmp}/rex-image-paste-$(id -u)"
 mkdir -p "$d" && [ -O "$d" ] && chmod 700 "$d" || { echo "REXPASTE-ERR cannot use $d"; sleep 60; exit 1; }
 find "$d" -type f -mmin +1440 -delete 2>/dev/null
 f="$d/$1"
-trap 'rm -f "$f.part"' EXIT
-if base64 -d > "$f.part" && mv "$f.part" "$f"; then
-  sum=$( (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") | cut -d' ' -f1)
-  printf 'REXPASTE-OK %s %s\n' "$sum" "$f"
+if [ -s "$f" ]; then
+  touch "$f"
+  printf 'REXPASTE-HIT %s\n' "$f"
+  sleep 60
+  exit 0
+fi
+stty -echo 2>/dev/null
+( sleep 120; kill 0 ) 2>/dev/null &
+t="$f.part.$$"
+trap 'rm -f "$t"' EXIT
+if base64 -d > "$t" && mv "$t" "$f"; then
+  printf 'REXPASTE-OK %s %s\n' "$( (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") | cut -d' ' -f1)" "$f"
 else
   echo "REXPASTE-ERR could not decode the upload"
 fi
@@ -108,9 +113,15 @@ local function now()
   return tonumber(r and r.stdout) or os.time()
 end
 
-local function unique_name(ext)
+local function temp_name()
   math.randomseed(os.time() + math.floor(os.clock() * 1e6))
-  return string.format("%s-%04x.%s", os.date("%Y%m%d-%H%M%S"), math.random(0, 0xffff), ext)
+  return string.format("incoming-%s-%04x", os.date("%Y%m%d-%H%M%S"), math.random(0, 0xffff))
+end
+
+local function exists(path)
+  local f = io.open(path)
+  if f then f:close() end
+  return f ~= nil
 end
 
 -- The action reads the clipboard of the machine its server runs on, so make
@@ -135,24 +146,49 @@ local function check_machine(ctx)
   end
 end
 
--- Returns kind ("png", "file", or "none") and a local path.
-local function read_clipboard(png_path)
-  local argv = { "osascript", "-l", "JavaScript", "-e", CLIPBOARD_JS, png_path }
+-- Saves the clipboard's image under base and returns the saved file and its
+-- extension, or nil when the clipboard has no image.
+local function read_clipboard(base)
+  local argv = { "osascript", "-l", "JavaScript", "-e", CLIPBOARD_JS, base }
   if M.options.pasteboard then argv[#argv + 1] = M.options.pasteboard end
   local out = exec(argv, { timeout = 5 }):gsub("%s+$", "")
   local kind, path = out:match("^(%w+)\t?(.*)$")
-  if kind == "png" then return "png", png_path end
-  if kind == "file" then return "file", path end
-  return "none", nil
+  if kind == "png" or kind == "tiff" then return base .. "." .. kind, kind end
+  if kind ~= "file" then return nil end
+  local ext = (path:match("%.(%w+)$") or ""):lower()
+  exec({ "cp", path, base .. "." .. ext })
+  return base .. "." .. ext, ext
 end
 
-local function shrink(path)
+-- Agents read PNG, JPEG, GIF, and WebP. Other formats are converted to PNG.
+local KEEP_FORMAT = { png = true, jpg = true, jpeg = true, gif = true, webp = true }
+
+local function output_ext(ext)
+  return KEEP_FORMAT[ext] and ext or "png"
+end
+
+-- Returns src ready to paste: converted to a format agents read, and shrunk.
+-- sips output isn't byte-for-byte repeatable, so images are named before this.
+local function prepare_image(src, base, ext)
+  local argv = { "sips" }
+  if output_ext(ext) ~= ext then
+    for _, a in ipairs({ "-s", "format", "png" }) do argv[#argv + 1] = a end
+  end
   local limit = M.options.max_dimension
-  if not limit then return end
-  local info = exec({ "sips", "-g", "pixelWidth", "-g", "pixelHeight", path })
-  local w = tonumber(info:match("pixelWidth: (%d+)")) or 0
-  local h = tonumber(info:match("pixelHeight: (%d+)")) or 0
-  if math.max(w, h) > limit then exec({ "sips", "-Z", tostring(limit), path }, { timeout = 10 }) end
+  if limit and ext ~= "gif" and ext ~= "webp" then
+    local info = exec({ "sips", "-g", "pixelWidth", "-g", "pixelHeight", src })
+    local w = tonumber(info:match("pixelWidth: (%d+)")) or 0
+    local h = tonumber(info:match("pixelHeight: (%d+)")) or 0
+    if math.max(w, h) > limit then
+      argv[#argv + 1] = "-Z"
+      argv[#argv + 1] = tostring(limit)
+    end
+  end
+  if #argv == 1 then return src end
+  local out = base .. "-ready." .. output_ext(ext)
+  for _, a in ipairs({ src, "--out", out }) do argv[#argv + 1] = a end
+  exec(argv, { timeout = 10 })
+  return out
 end
 
 local function block_method(api, session_id, block_id, method, args)
@@ -169,8 +205,14 @@ local function paste_text(api, ctx, text)
   })
 end
 
--- Copies local_path to the server behind `api` and returns the remote path.
-local function upload(api, session_id, local_path, name)
+local function sha256(path)
+  return exec({ "shasum", "-a", "256", path }):match("^(%x+)")
+end
+
+-- Copies a file to the server behind `api` as name, unless the server already
+-- has name. prepare() returns the file to send and its SHA-256; it runs only
+-- when the file is needed. Returns the remote path and whether it was there.
+local function upload(api, session_id, name, prepare)
   local started = M.trace and now()
   local function mark(label) if M.trace then M.trace(label, now() - started) end end
   local stop = os.time() + M.options.timeout
@@ -181,8 +223,6 @@ local function upload(api, session_id, local_path, name)
     end
   end
 
-  local sum = exec({ "shasum", "-a", "256", local_path }):match("^(%x+)")
-  local encoded = exec({ "base64", "-b", "76", "-i", local_path })
   local block_id = must("start upload terminal", api.call, "session.new_block", {
     session_id = session_id,
     flavor = SHELL,
@@ -193,37 +233,49 @@ local function upload(api, session_id, local_path, name)
       size = { columns = 400, rows = 10 },
     },
   }).block_id
-  mark("encoded " .. #encoded .. " bytes, started terminal")
+  mark("started terminal")
 
-  local ok, result = pcall(function()
-    -- Wait for `stty -echo`, so the hidden terminal doesn't draw the upload.
+  local function screen_text()
+    local screen = block_method(api, session_id, block_id, "format", { trim = true, unwrap = true })
+    local text = screen and screen.content or ""
+    local why = text:match("REXPASTE%-ERR ([^\r\n]+)")
+    if why then fail(why) end
+    return text
+  end
+
+  local ok, result, cached = pcall(function()
+    -- The remote either reports a copy it already has, or turns off echo
+    -- (so the hidden terminal doesn't draw the upload) and waits for one.
     while true do
       local mode = block_method(api, session_id, block_id, "input_mode")
       if mode and mode.echo == false then break end
+      local path = screen_text():match("REXPASTE%-HIT ([^\r\n]+)")
+      if path then
+        mark("already there")
+        return path, true
+      end
       check_time("starting the upload")
       sleep(0.02)
     end
     mark("echo off")
 
+    local local_path, sum = prepare()
+    local encoded = exec({ "base64", "-b", "76", "-i", local_path })
     local size = M.options.chunk_size
     for i = 1, #encoded, size do
       must("upload", block_method, api, session_id, block_id, "write", { data = encoded:sub(i, i + size - 1) })
       check_time(string.format("uploading (%d of %d KiB sent)", math.floor(i / 1024), math.floor(#encoded / 1024)))
     end
     must("upload", block_method, api, session_id, block_id, "write", { data = "\n\004" })
-    mark("wrote " .. math.ceil(#encoded / size) .. " chunks")
+    mark("wrote " .. #encoded .. " bytes in " .. math.ceil(#encoded / size) .. " chunks")
 
     while true do
-      local screen = block_method(api, session_id, block_id, "format", { trim = true, unwrap = true })
-      local text = screen and screen.content or ""
-      local got, path = text:match("REXPASTE%-OK (%x+) ([^\r\n]+)")
+      local got, path = screen_text():match("REXPASTE%-OK (%x+) ([^\r\n]+)")
       if got then
         if got ~= sum then fail("checksum mismatch for " .. path) end
         mark("decoded and verified")
-        return path
+        return path, false
       end
-      local why = text:match("REXPASTE%-ERR ([^\r\n]+)")
-      if why then fail(why) end
       check_time("waiting for the remote file")
       sleep(0.05)
     end
@@ -231,7 +283,7 @@ local function upload(api, session_id, local_path, name)
 
   api.call("block.close", { session_id = session_id, block_id = block_id })
   if not ok then error(result, 0) end
-  return result
+  return result, cached
 end
 
 -- The action body. ctx needs session_id and block_id, and server for a pane
@@ -241,33 +293,45 @@ function M.paste(ctx)
   check_machine(ctx)
   local api = ctx.server and rex.server(ctx.server) or rex
   exec({ "mkdir", "-p", M.options.local_dir })
-  local name = unique_name("png")
-  local staged = M.options.local_dir .. "/" .. name
-  local kind, path = read_clipboard(staged)
+  local base = M.options.local_dir .. "/" .. temp_name()
+  local src, ext = read_clipboard(base)
 
-  if kind == "none" then
+  if not src then
     local text = exec({ "pbpaste" }, { env = { LANG = "en_US.UTF-8", LC_ALL = "en_US.UTF-8" } })
     if text ~= "" then paste_text(api, ctx, text) end
     return { pasted = "text" }
   end
 
-  if kind == "file" then
-    -- Stage a copy with a predictable name and no spaces.
-    name = name:gsub("png$", (path:match("%.(%w+)$") or "png"):lower())
-    staged = M.options.local_dir .. "/" .. name
-    exec({ "cp", path, staged })
+  -- Name the image after the clipboard's bytes, so pasting it again reuses
+  -- the copy, and convert and shrink it only when a copy is needed.
+  local name = sha256(src):sub(1, 16) .. "." .. output_ext(ext)
+  local ready
+  local function prepare()
+    ready = prepare_image(src, base, ext)
+    return ready, sha256(ready)
   end
-  if not name:match("%.gif$") and not name:match("%.webp$") then shrink(staged) end
+  local function clean_up()
+    os.remove(src)
+    if ready and ready ~= src then os.remove(ready) end
+  end
 
-  local target = staged
+  local target, cached
   if ctx.server then
-    local ok, remote = pcall(upload, api, ctx.session_id, staged, name)
-    os.remove(staged)
+    local ok, remote, hit = pcall(upload, api, ctx.session_id, name, prepare)
+    clean_up()
     if not ok then error(remote, 0) end
-    target = remote
+    target, cached = remote, hit
+  else
+    target = M.options.local_dir .. "/" .. name
+    cached = exists(target)
+    if not cached then
+      prepare()
+      os.rename(ready, target)
+    end
+    clean_up()
   end
   paste_text(api, ctx, target)
-  return { pasted = "image", path = target, server = ctx.server }
+  return { pasted = "image", path = target, server = ctx.server, cached = cached }
 end
 
 function M.setup(opts)

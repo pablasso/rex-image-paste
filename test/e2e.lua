@@ -72,26 +72,38 @@ local target = assert(api.call("session.new_block", {
 })).block_id
 rex.sleep(0.5)
 
-local ok, result = pcall(M.paste, { server = host, session_id = session_id, block_id = target })
-if check(ok, tostring(result)) then
-  check(result.pasted == "image", "pasted " .. tostring(result.pasted) .. ", not an image")
+local function paste_and_check(label)
+  local ok, result = pcall(M.paste, { server = host, session_id = session_id, block_id = target })
+  if not check(ok, label .. ': ' .. tostring(result)) then return nil end
+  check(result.pasted == "image", label .. ": pasted " .. tostring(result.pasted) .. ", not an image")
   rex.sleep(0.3)
   local screen = api.call("block.method", {
     session_id = session_id, block_id = target, method = "format", args = { trim = true, unwrap = true },
   })
   local shown = screen and screen.content or ""
   check(shown:find("^[[200~" .. result.path .. "^[[201~", 1, true),
-    "the pane didn't receive a bracketed paste of " .. tostring(result.path) .. "; it shows: " .. shown)
-  rex.log("pasted " .. tostring(result.path) .. (host and (" on " .. host) or ""))
+    label .. ": the pane didn't receive a bracketed paste of " .. tostring(result.path) .. "; it shows: " .. shown)
+  rex.log(string.format("%s: pasted %s%s%s", label, result.path, host and (" on " .. host) or "",
+    result.cached and " (already there)" or ""))
+  return result
+end
 
-  -- Remove the test image.
-  if host then
+local first = paste_and_check("first paste")
+local again = first and paste_and_check("same image again")
+if again then
+  check(again.cached, "the same image was copied again")
+  check(again.path == first.path, "the same image got another path: " .. tostring(again.path))
+end
+
+-- Remove the test images.
+for _, result in ipairs({ first or false, again or false }) do
+  if result and host then
     api.call("session.new_block", {
       session_id = session_id,
       flavor = "com.superlogical.terminal.shell",
       options = { shell = "none", command = { "rm", "-f", result.path } },
     })
-  else
+  elseif result then
     os.remove(result.path)
   end
 end

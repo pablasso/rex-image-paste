@@ -271,7 +271,15 @@ function M.paste(ctx)
 end
 
 function M.setup(opts)
-  for k, v in pairs(opts or {}) do M.options[k] = v end
+  local known = { pasteboard = true }
+  for k in pairs(M.options) do known[k] = true end
+  for k, v in pairs(opts or {}) do
+    if known[k] then
+      M.options[k] = v
+    else
+      rex.log("warn", "rex-image-paste: ignoring unknown option " .. tostring(k))
+    end
+  end
   rex.action{
     name = "image_paste",
     title = "Paste (Images as File Paths)",
